@@ -13,7 +13,7 @@ def _monogenic_transform(im):
     return np.array(signal.MonogenicImage(im))
 
 
-class _LASLDataset(Dataset):
+class _LaslDataset(Dataset):
     def __init__(
         self, annotations_file, img_dir, transform=None, target_transform=None
     ):
@@ -37,7 +37,7 @@ class _LASLDataset(Dataset):
         return image, label
 
 
-class LASLDataset:
+class LaslDataset:
     tr = {"dost": _dost_transform, "monogenic": _monogenic_transform}
 
     def __init__(self, base_dir, transform="dost"):
@@ -49,7 +49,7 @@ class LASLDataset:
 
     def _load(self, name):
         cwd = self.base_dir / name
-        self.__dict__[name + "_data"] = _LASLDataset(
+        self.__dict__[name + "_data"] = _LaslDataset(
             cwd / "map.txt",
             cwd,
             transform=self.transform,

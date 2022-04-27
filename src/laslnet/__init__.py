@@ -66,9 +66,9 @@ def laslnet_main():
     model = LaslNet()
     model.to(dev)
     print(f"Model on {dev}")
-    ds = dataset.LASLDataset(dataset_path)
-    print(f"Start training with {len(ds.train_data)} records")
-    train(model, ds.train_data)
+    df = dataset.LaslDataset(dataset_path)
+    print(f"Start training with {len(df.train_data)} records")
+    train(model, df.train_data)
     torch.save(model.state_dict(), model_path)
-    val(model, ds.val_data)
+    val(model, df.val_data)
     return 0
