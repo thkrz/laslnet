@@ -61,7 +61,7 @@ def laslnet_main():
     config.read(sys.argv[-1])
 
     dataset_path = config["DEFAULT"]["dataset_path"]
-    model_path = config["DEFAULT"].get("model_path", "./laslnet45.pth")
+    model_path = config["DEFAULT"].get("model_path", "./laslnet.pth")
 
     model = LaslNet()
     model.to(dev)
