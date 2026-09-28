@@ -4,4 +4,4 @@
 
 ## Dependencies
 
-* [xyston](https://github.com/thkrz/xyston)
+* [fstpack](https://github.com/thkrz/fstpack)
