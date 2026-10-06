@@ -1,0 +1,7 @@
+#!/bin/bash
+ROOT="$HOME"/work/src/laslnet
+script="$ROOT/scripts/${1}.py"
+shift
+exec env -u LD_LIBRARY_PATH \
+  "$HOME"/work/src/laslnet/venv/bin/python \
+  "$script" "$@"
