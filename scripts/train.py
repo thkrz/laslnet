@@ -5,59 +5,12 @@ from pathlib import Path
 import h5py
 import numpy as np
 import torch
-from torch import nn
 from torch.nn import functional as F
 
+from nn import Net
+from u import positive
+
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-
-class modReLU(nn.Module):
-    def __init__(self, channels):
-        super().__init__()
-        self.bias = nn.Parameter(torch.full((channels,), -0.01))
-
-    def forward(self, z):
-        m = z.abs()
-        b = self.bias.view(1, -1, 1, 1)
-        s = F.relu(m + b) / m.clamp_min(1e-8)
-        return z * s
-
-
-def block(cin, cout, stride=1):
-    c = torch.complex64
-    return nn.Sequential(
-        nn.Conv2d(cin, cout, 3, stride=stride, padding=1, dtype=c),
-        modReLU(cout),
-        nn.Conv2d(cout, cout, 3, padding=1, dtype=c),
-        modReLU(cout),
-    )
-
-
-class Net(nn.Module):
-    def __init__(self, voices):
-        super().__init__()
-        c = torch.complex64
-        self.e1 = block(voices, 64)
-        self.e2 = block(64, 128, 2)
-        self.e3 = block(128, 256, 2)
-        self.b = block(256, 512, 2)
-        self.up3 = nn.ConvTranspose2d(512, 256, 2, stride=2, dtype=c)
-        self.d3 = block(512, 256)
-        self.up2 = nn.ConvTranspose2d(256, 128, 2, stride=2, dtype=c)
-        self.d2 = block(256, 128)
-        self.up1 = nn.ConvTranspose2d(128, 64, 2, stride=2, dtype=c)
-        self.d1 = block(128, 64)
-        self.head = nn.Conv2d(128, 1, 1)
-
-    def forward(self, x):
-        x1 = self.e1(x)
-        x2 = self.e2(x1)
-        x3 = self.e3(x2)
-        x = self.b(x3)
-        x = self.d3(torch.cat((self.up3(x), x3), 1))
-        x = self.d2(torch.cat((self.up2(x), x2), 1))
-        x = self.d1(torch.cat((self.up1(x), x1), 1))
-        return self.head(torch.cat((x.real, x.imag), 1))
 
 
 def dost(im, scale=0.5):
@@ -213,29 +166,67 @@ def posweight(path):
     return (total - pos) / pos
 
 
+@torch.no_grad()
+def validate(net, path, batch_size):
+    net.eval()
+    intersection = torch.zeros((), dtype=torch.int64, device=device)
+    union = torch.zeros((), dtype=torch.int64, device=device)
+
+    for x, y in samples(path, batch_size):
+        pred = net(x)[:, 0] >= 0
+        truth = y != 0
+        intersection += (pred & truth).sum()
+        union += (pred | truth).sum()
+
+    if union.item() == 0:
+        raise ValueError("validation IoU is undefined: empty union")
+
+    return (intersection.double() / union).item()
+
+
 def main(argv=None):
     parser = argparse.ArgumentParser(description="train a landslide detector")
     parser.add_argument(
-        "-b", "--batch-size", type=int, default=8, help="training batch size"
+        "-b",
+        "--batch-size",
+        type=positive,
+        default=8,
+        help="training and validation batch size",
     )
-    parser.add_argument("-e", "--epochs", type=int, default=20, help="training epochs")
-    parser.add_argument("data", type=Path, help="context file")
+    parser.add_argument(
+        "-e",
+        "--epochs",
+        type=positive,
+        default=20,
+        help="training epochs",
+    )
+    parser.add_argument("data", type=Path, help="training contexts")
+    parser.add_argument("validation", type=Path, help="validation contexts")
     parser.add_argument("model", type=Path, help="output model")
     args = parser.parse_args(argv)
 
-    weight = torch.tensor(posweight(args.data), device=device)
     voices, patch = shape(args.data)
+    if shape(args.validation) != (voices, patch):
+        parser.error("training and validation dimensions must match")
+
+    weight = torch.tensor(posweight(args.data), device=device)
     net = Net(voices).to(device)
     opt = torch.optim.Adam(net.parameters(), lr=0.0003)
+    best = -1.0
 
     for epoch in range(args.epochs):
+        net.train()
         total = torch.zeros((), device=device)
         count = 0
 
         for x, y in samples(args.data, args.batch_size):
             opt.zero_grad(set_to_none=True)
             logits = net(x)[:, 0]
-            loss = F.binary_cross_entropy_with_logits(logits, y, pos_weight=weight)
+            loss = F.binary_cross_entropy_with_logits(
+                logits,
+                y,
+                pos_weight=weight,
+            )
             loss.backward()
             opt.step()
 
@@ -243,14 +234,26 @@ def main(argv=None):
             total += loss.detach() * size
             count += size
 
+        train_loss = total.item() / count
+        iou = validate(net, args.validation, args.batch_size)
+        improved = iou > best
+
+        if improved:
+            state = {k: v.detach().cpu() for k, v in net.state_dict().items()}
+            torch.save(
+                {"voices": voices, "n": patch, "state": state},
+                args.model,
+            )
+            best = iou
+
         print(
-            f"epoch={epoch + 1} loss={total.item() / count:.6f}",
+            f"epoch={epoch + 1} loss={train_loss:.6f} "
+            f"val_iou={iou:.6f} best_iou={best:.6f} "
+            f"saved={int(improved)}",
             file=sys.stderr,
             flush=True,
         )
 
-    state = {k: v.detach().cpu() for k, v in net.state_dict().items()}
-    torch.save({"voices": voices, "n": patch, "state": state}, args.model)
     return 0
 
 
