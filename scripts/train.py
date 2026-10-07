@@ -5,7 +5,6 @@ from pathlib import Path
 import h5py
 import numpy as np
 import torch
-from numpy.lib.stride_tricks import sliding_window_view
 from torch import nn
 from torch.nn import functional as F
 
@@ -117,14 +116,12 @@ def dost(im, scale=0.5):
     return S
 
 
-def voice(s, x, y):
-    k = s.shape[-1]
+def ivoice(k, x, y, device):
     n = k.bit_length() - 2
-    v = 2 * n + 2
-    ix = torch.empty(v, dtype=torch.long, device=s.device)
-    iy = torch.empty(v, dtype=torch.long, device=s.device)
+    ix = []
+    iy = []
 
-    for i, p in enumerate(range(-n, n + 2)):
+    for p in range(-n, n + 2):
         if p == 0:
             bx = by = 0
         elif p == n + 1:
@@ -137,29 +134,42 @@ def voice(s, x, y):
                 bx, by = b + tx, b + ty
             else:
                 bx, by = k - b - tx, k - b - ty
-        ix[i] = bx
-        iy[i] = by
+        ix.append(bx)
+        iy.append(by)
 
-    return s.index_select(-2, ix).index_select(-1, iy)
+    return (
+        torch.tensor(ix, dtype=torch.long, device=device),
+        torch.tensor(iy, dtype=torch.long, device=device),
+    )
 
 
+@torch.no_grad()
 def embed(data, patch, window, device):
     half = window // 2
     voices = 2 * (window.bit_length() - 1)
-    out = np.empty((patch * patch, voices * voices), np.complex64)
-    wins = sliding_window_view(data, (window, window))
-    batch = max(1, (16 * 1024 * 1024) // (4 * window * window))
+    channels = voices * voices
+    ix, iy = ivoice(window, half, half, device)
+
+    data = torch.as_tensor(data, dtype=torch.float32, device=device)
+    wins = data.unfold(0, window, 1).unfold(1, window, 1)
+    out = torch.empty(
+        (patch * patch, channels),
+        dtype=torch.complex64,
+        device=device,
+    )
+    batch = max(1, (256 * 1024 * 1024) // (4 * window * window))
 
     for i in range(0, len(out), batch):
         j = min(i + batch, len(out))
-        indices = np.arange(i, j)
-        samples = wins[indices // patch, indices % patch]
-        x = torch.as_tensor(samples, device=device)
+        indices = torch.arange(i, j, device=device)
+        x = wins[indices // patch, indices % patch]
         x = x - x.mean((-1, -2), keepdim=True)
-        z = voice(dost(x), half, half)
-        out[i:j] = z.reshape(j - i, -1).cpu().numpy()
+        s = dost(x)
+        z = s.index_select(-2, ix).index_select(-1, iy)
+        out[i:j] = z.reshape(j - i, channels)
+        del x, s, z
 
-    return out.reshape(patch, patch, -1).transpose(2, 0, 1)[None]
+    return out.reshape(patch, patch, channels).permute(2, 0, 1).contiguous()
 
 
 def shape(path):
@@ -169,17 +179,25 @@ def shape(path):
     return (2 * (window.bit_length() - 1)) ** 2, patch
 
 
-def samples(path):
+def samples(path, batch_size):
     with h5py.File(path, "r") as f:
         data = f["DATA"]
         mask = f["MASK"]
         patch = int(f.attrs["p"])
         window = int(f.attrs["w"])
-        i = 0
         count = data.shape[0]
-        while i < count:
-            yield embed(data[i], patch, window, device), mask[i]
-            i += 1
+
+        for first in range(0, count, batch_size):
+            last = min(first + batch_size, count)
+            x = torch.stack(
+                [embed(data[i], patch, window, device) for i in range(first, last)]
+            )
+            y = torch.as_tensor(
+                mask[first:last],
+                dtype=torch.float32,
+                device=device,
+            )
+            yield x, y
 
 
 def posweight(path):
@@ -197,6 +215,9 @@ def posweight(path):
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description="train a landslide detector")
+    parser.add_argument(
+        "-b", "--batch-size", type=int, default=8, help="training batch size"
+    )
     parser.add_argument("-e", "--epochs", type=int, default=20, help="training epochs")
     parser.add_argument("data", type=Path, help="context file")
     parser.add_argument("model", type=Path, help="output model")
@@ -208,21 +229,22 @@ def main(argv=None):
     opt = torch.optim.Adam(net.parameters(), lr=0.0003)
 
     for epoch in range(args.epochs):
-        total = 0.0
+        total = torch.zeros((), device=device)
         count = 0
-        for x, y in samples(args.data):
-            x = torch.as_tensor(x, device=device)
-            y = torch.as_tensor(y, dtype=torch.float32, device=device)
-            opt.zero_grad()
-            loss = F.binary_cross_entropy_with_logits(
-                net(x)[0, 0], y, pos_weight=weight
-            )
+
+        for x, y in samples(args.data, args.batch_size):
+            opt.zero_grad(set_to_none=True)
+            logits = net(x)[:, 0]
+            loss = F.binary_cross_entropy_with_logits(logits, y, pos_weight=weight)
             loss.backward()
             opt.step()
-            total += loss.item()
-            count += 1
+
+            size = y.shape[0]
+            total += loss.detach() * size
+            count += size
+
         print(
-            f"epoch={epoch + 1} loss={total / count:.6f}",
+            f"epoch={epoch + 1} loss={total.item() / count:.6f}",
             file=sys.stderr,
             flush=True,
         )

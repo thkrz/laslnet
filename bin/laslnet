@@ -1,7 +1,12 @@
 #!/bin/bash
+if [ -z "$1" ]; then
+	echo "usage: laslnet COMMAND" >&2
+	exit 1
+fi
+
 ROOT="$HOME"/work/src/laslnet
 script="$ROOT/scripts/${1}.py"
 shift
 exec env -u LD_LIBRARY_PATH \
-  "$HOME"/work/src/laslnet/venv/bin/python \
-  "$script" "$@"
+	"$HOME"/work/src/laslnet/venv/bin/python \
+	"$script" "$@"
