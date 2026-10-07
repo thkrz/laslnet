@@ -31,12 +31,11 @@ def annotations(path, shape, transform):
 
 def tiles(bad, ann, patch, half, far):
     height, width = ann.shape
-    stride = patch + half + far
     pos = []
     neg = []
 
-    for row in range(half, height - patch - far + 1, stride):
-        for col in range(half, width - patch - far + 1, stride):
+    for row in range(half, height - patch - far + 1, patch):
+        for col in range(half, width - patch - far + 1, patch):
             if bad[
                 row - half : row + patch + far,
                 col - half : col + patch + far,
@@ -48,6 +47,16 @@ def tiles(bad, ann, patch, half, far):
                 neg.append((row, col))
 
     return pos, neg
+
+
+def balanced(pos, neg, rng):
+    n = len(pos)
+    if len(neg) < n:
+        raise ValueError("not enough empty patches to match annotations")
+
+    coords = pos + rng.sample(neg, n)
+    rng.shuffle(coords)
+    return coords
 
 
 def partition(coords, axis, cut, patch, half, far):
@@ -97,7 +106,7 @@ def write(path, dem, ann, coords, patch, half, far):
 
 def main(argv=None):
     parser = argparse.ArgumentParser(
-        description="prepare balanced training and validation contexts"
+        description="prepare spatially separated, balanced DEM contexts"
     )
     parser.add_argument(
         "-p",
@@ -118,7 +127,7 @@ def main(argv=None):
         dest="ratio",
         type=fraction,
         default=0.2,
-        help="validation fraction of annotated patches (default: 0.2)",
+        help="target validation fraction of annotated patches",
     )
     parser.add_argument("dem", type=Path, help="elevation raster")
     parser.add_argument("annotation", type=Path, help="annotation vectors")
@@ -128,6 +137,8 @@ def main(argv=None):
 
     if args.patch % 8:
         parser.error("patch size must be a multiple of 8")
+    if args.window < 2:
+        parser.error("window size must be at least 2")
     if args.data.resolve() == args.validation.resolve():
         parser.error("training and validation outputs must differ")
 
@@ -145,23 +156,35 @@ def main(argv=None):
         )
 
     pos, neg = tiles(bad, ann, args.patch, half, far)
-    n = len(pos)
-    valid = int(n * args.ratio)
-
-    if not 0 < valid < n:
+    target = int(len(pos) * args.ratio)
+    if not 0 < target < len(pos):
         parser.error(
             "ratio and annotated patch count must leave "
             "at least one annotated patch in each set"
         )
-    if len(neg) < n:
-        parser.error("not enough empty patches to match all annotated patches")
+
+    height, width = ann.shape
+    axis = 1 if width >= height else 0
+    ordered = sorted(pos, key=lambda coord: coord[axis])
+    cut = ordered[len(pos) - target][axis] - half
+
+    train_pos, val_pos = partition(pos, axis, cut, args.patch, half, far)
+    train_neg, val_neg = partition(neg, axis, cut, args.patch, half, far)
+
+    if not train_pos:
+        parser.error("training region has no eligible annotated patches")
+    if not val_pos:
+        parser.error("validation region has no eligible annotated patches")
+    if len(train_neg) < len(train_pos):
+        parser.error("training region has insufficient empty patches for 1:1 balancing")
+    if len(val_neg) < len(val_pos):
+        parser.error(
+            "validation region has insufficient empty patches for 1:1 balancing"
+        )
 
     rng = random.Random(0)
-    rng.shuffle(pos)
-    neg = rng.sample(neg, n)
-
-    validation = pos[:valid] + neg[:valid]
-    training = pos[valid:] + neg[valid:]
+    training = train_pos + rng.sample(train_neg, len(train_pos))
+    validation = val_pos + rng.sample(val_neg, len(val_pos))
     rng.shuffle(training)
     rng.shuffle(validation)
 
@@ -184,8 +207,25 @@ def main(argv=None):
         far,
     )
 
-    print(f"training annotated={n - valid} empty={n - valid} total={len(training)}")
-    print(f"validation annotated={valid} empty={valid} total={len(validation)}")
+    dropped_pos = len(pos) - len(train_pos) - len(val_pos)
+    dropped_neg = len(neg) - len(train_neg) - len(val_neg)
+    actual = len(val_pos) / (len(train_pos) + len(val_pos))
+    direction = "columns" if axis == 1 else "rows"
+
+    print(
+        f"split_axis={direction} cut={cut} "
+        f"target_fraction={args.ratio:.4f} "
+        f"actual_fraction={actual:.4f}"
+    )
+    print(f"crossing annotated={dropped_pos} empty={dropped_neg}")
+    print(
+        f"training annotated={len(train_pos)} "
+        f"empty={len(train_pos)} total={len(training)}"
+    )
+    print(
+        f"validation annotated={len(val_pos)} "
+        f"empty={len(val_pos)} total={len(validation)}"
+    )
     return 0
 
 
