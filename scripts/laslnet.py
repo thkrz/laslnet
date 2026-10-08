@@ -118,10 +118,10 @@ def dost(im):
         else:
             b = 1 << (abs(p) - 1)
             if p > 0:
-                band = slice(b, 2 * b)
+                sl = slice(b, 2 * b)
             else:
-                band = slice(N - 2 * b + 1, N - b + 1)
-            rows.append(band(x[..., band, :].transpose(-2, -1)))
+                sl = slice(N - 2 * b + 1, N - b + 1)
+            rows.append(band(x[..., sl, :].transpose(-2, -1)))
 
     z = torch.stack(rows, dim=-2)
     neg = torch.cat(
@@ -247,8 +247,6 @@ def prepare(args):
     parser = args.parser
     if args.patch % 8:
         parser.error("patch size must be a multiple of 8")
-    if args.window < 2:
-        parser.error("window size must be at least 2")
     if args.data.resolve() == args.validation.resolve():
         parser.error("training and validation outputs must differ")
 
@@ -275,7 +273,7 @@ def prepare(args):
     height, width = ann.shape
     axis = 1 if width >= height else 0
     ordered = sorted(pos, key=lambda coord: coord[axis])
-    cut = ordered[len(pos) - target][axis] - half
+    cut = ordered[-target][axis] - half
 
     train_pos, val_pos = partition(pos, axis, cut, args.patch, half, far)
     train_neg, val_neg = partition(neg, axis, cut, args.patch, half, far)
@@ -368,19 +366,19 @@ def posweight(path):
 @torch.no_grad()
 def validate(net, path, batch):
     net.eval()
-    intersection = torch.zeros((), dtype=torch.int64, device=device)
-    union = torch.zeros((), dtype=torch.int64, device=device)
+    intersection = 0
+    union = 0
 
     for x, y in samples(path, batch):
         pred = net(x)[:, 0] >= 0
         truth = y != 0
-        intersection += (pred & truth).sum()
-        union += (pred | truth).sum()
+        intersection += (pred & truth).sum().item()
+        union += (pred | truth).sum().item()
 
-    if union.item() == 0:
+    if union == 0:
         raise ValueError("validation IoU is undefined: empty union")
 
-    return (intersection.double() / union).item()
+    return intersection / union
 
 
 def save(path, net, voices, patch, window):
