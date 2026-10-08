@@ -94,7 +94,7 @@ def dost(im, scale=0.5):
     N = im.shape[-1]
     m = N // 2
     n = N.bit_length() - 2
-    IM = torch.fft.fft2(im) / (N * N)
+    IM = torch.fft.fft2(im, norm="ortho")
     S = torch.zeros_like(IM)
 
     S[..., 0, 0] = IM[..., 0, 0]
@@ -372,21 +372,22 @@ def shape(path):
     return voices, patch, window
 
 
-def samples(path, batch):
+def samples(path, batch, shuffle=False):
     with h5py.File(path, "r") as f:
         data = f["DATA"]
         mask = f["MASK"]
         patch = int(f.attrs["p"])
         window = int(f.attrs["w"])
-        count = data.shape[0]
+        order = list(range(data.shape[0]))
 
-        for first in range(0, count, batch):
-            last = min(first + batch, count)
-            x = torch.stack(
-                [embed(data[i], patch, window, device) for i in range(first, last)]
-            )
+        if shuffle:
+            random.shuffle(order)
+
+        for first in range(0, len(order), batch):
+            indices = order[first : first + batch]
+            x = torch.stack([embed(data[i], patch, window, device) for i in indices])
             y = torch.as_tensor(
-                mask[first:last],
+                np.stack([mask[i] for i in indices]),
                 dtype=torch.float32,
                 device=device,
             )
@@ -474,7 +475,7 @@ def train(args):
         total = torch.zeros((), device=device)
         count = 0
 
-        for x, y in samples(args.data, args.batch):
+        for x, y in samples(args.data, args.batch, shuffle=True):
             opt.zero_grad(set_to_none=True)
             logits = net(x)[:, 0]
             loss = F.binary_cross_entropy_with_logits(
