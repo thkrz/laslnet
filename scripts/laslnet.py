@@ -90,95 +90,54 @@ class Net(nn.Module):
         return self.head(torch.cat((x.real, x.imag), 1))
 
 
-def dost(im, scale=0.5):
+def band(a):
+    b = a.shape[-1]
+    z = (a[..., ::2].sum(-1) - a[..., 1::2].sum(-1)) * (b**-0.5)
+    return -z if b == 2 else z
+
+
+def dost(im):
     N = im.shape[-1]
     m = N // 2
     n = N.bit_length() - 2
-    IM = torch.fft.fft2(im, norm="ortho")
-    S = torch.zeros_like(IM)
+    IM = torch.fft.fft2(im) / (N * N)
 
-    S[..., 0, 0] = IM[..., 0, 0]
-    S[..., 0, m] = IM[..., 0, m]
-    S[..., m, 0] = IM[..., m, 0]
-    S[..., m, m] = IM[..., m, m]
+    cols = [IM[..., 0]]
+    for p in range(n):
+        b = 1 << p
+        cols.append(band(IM[..., b : 2 * b]))
+    cols.append(IM[..., m])
+    x = torch.stack(cols, dim=-1)
 
-    for py in range(n):
-        ny = 1 << py
-        pos = slice(ny, 2 * ny)
-        neg = slice(N - 2 * ny + 1, N - ny + 1)
-        rows = torch.stack(
-            (
-                IM[..., pos, 0],
-                IM[..., neg, 0],
-                IM[..., pos, m],
-                IM[..., neg, m],
-            )
-        )
-        rows = torch.fft.ifft(torch.fft.fftshift(rows, dim=-1), dim=-1)
-        rows = rows * (ny**scale)
-        S[..., pos, 0] = rows[0]
-        S[..., neg, 0] = rows[1].flip(-1)
-        S[..., pos, m] = rows[2]
-        S[..., neg, m] = rows[3].flip(-1)
-
-    for px in range(n):
-        nx = 1 << px
-        col = slice(nx, 2 * nx)
-        x = torch.fft.ifft(torch.fft.fftshift(IM[..., col], dim=-1), dim=-1)
-        x = x * (nx**scale)
-        S[..., 0, col] = x[..., 0, :]
-        S[..., m, col] = x[..., m, :]
-
-        for py in range(n):
-            ny = 1 << py
-            pos = slice(ny, 2 * ny)
-            neg = slice(N - 2 * ny + 1, N - ny + 1)
-            y = torch.stack((x[..., pos, :], x[..., neg, :]))
-            y = torch.fft.ifft(torch.fft.fftshift(y, dim=-2), dim=-2)
-            y = y * (ny**scale)
-            S[..., pos, col] = y[0]
-            S[..., neg, col] = y[1].flip(-2)
-
-    S[..., 1:m, m + 1 :] = S[..., m + 1 :, 1:m].flip(-1).flip(-2).conj()
-    S[..., m + 1 :, m + 1 :] = S[..., 1:m, 1:m].flip(-1).flip(-2).conj()
-    S[..., 0, m + 1 :] = S[..., 0, 1:m].flip(-1).conj()
-    S[..., m, m + 1 :] = S[..., m, 1:m].flip(-1).conj()
-    return S
-
-
-def ivoice(k, x, y, device):
-    n = k.bit_length() - 2
-    ix = []
-    iy = []
-
+    rows = []
     for p in range(-n, n + 2):
         if p == 0:
-            bx = by = 0
+            rows.append(x[..., 0, :])
         elif p == n + 1:
-            bx = by = k // 2
+            rows.append(x[..., m, :])
         else:
             b = 1 << (abs(p) - 1)
-            tx = x * b // k
-            ty = y * b // k
             if p > 0:
-                bx, by = b + tx, b + ty
+                band = slice(b, 2 * b)
             else:
-                bx, by = k - b - tx, k - b - ty
-        ix.append(bx)
-        iy.append(by)
+                band = slice(N - 2 * b + 1, N - b + 1)
+            rows.append(band(x[..., band, :].transpose(-2, -1)))
 
-    return (
-        torch.tensor(ix, dtype=torch.long, device=device),
-        torch.tensor(iy, dtype=torch.long, device=device),
-    )
+    z = torch.stack(rows, dim=-2)
+    neg = torch.cat(
+        (
+            z[..., : 2 * n + 1, 1 : n + 1].flip((-2, -1)),
+            z[..., 2 * n + 1 :, 1 : n + 1].flip(-1),
+        ),
+        dim=-2,
+    ).conj()
+    return torch.cat((neg, z), dim=-1)
 
 
 @torch.no_grad()
 def embed(data, patch, window, device):
-    half = window // 2
     voices = 2 * (window.bit_length() - 1)
     channels = voices * voices
-    ix, iy = ivoice(window, half, half, device)
 
     data = torch.as_tensor(data, dtype=torch.float32, device=device)
     data = data.contiguous()
@@ -195,10 +154,9 @@ def embed(data, patch, window, device):
         indices = torch.arange(i, j, device=device)
         x = wins[indices // patch, indices % patch]
         x = x - x.mean((-1, -2), keepdim=True)
-        s = dost(x)
-        z = s.index_select(-2, ix).index_select(-1, iy)
+        z = dost(x)
         out[i:j] = z.reshape(j - i, channels)
-        del x, s, z
+        del x, z
 
     return out.reshape(patch, patch, channels).permute(2, 0, 1).contiguous()
 
