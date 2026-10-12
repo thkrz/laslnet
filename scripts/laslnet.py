@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 import argparse
 import random
 import sys
@@ -15,36 +16,10 @@ from torch.nn import functional as F
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
-def fraction(value):
-    n = float(value)
-    if not 0 < n < 1:
-        raise argparse.ArgumentTypeError("must be between 0 and 1")
-    return n
-
-
-def positive(value):
-    n = int(value)
-    if n < 1:
-        raise argparse.ArgumentTypeError("must be positive")
-    return n
-
-
-def powersz(value):
-    n = positive(value)
-    if n < 2 or n & (n - 1):
-        raise argparse.ArgumentTypeError("must be a power of two")
-    return n
-
-
-def margin(window):
-    half = window // 2
-    return half, half - 1
-
-
 class modReLU(nn.Module):
     def __init__(self, channels):
         super().__init__()
-        self.bias = nn.Parameter(torch.full((channels,), -0.01))
+        self.bias = nn.Parameter(torch.full((channels,), -0.1))
 
     def forward(self, z):
         m = z.abs()
@@ -102,9 +77,121 @@ class Net(nn.Module):
         return self.head(torch.cat((x.real, x.imag), 1))
 
 
+def margin(window):
+    half = window // 2
+    return half, half - 1
+
+
+def band(a):
+    b = a.shape[-1]
+    z = (a[..., ::2].sum(-1) - a[..., 1::2].sum(-1)) * (b**-0.5)
+    return -z if b == 2 else z
+
+
+def dost(im):
+    N = im.shape[-1]
+    m = N // 2
+    n = N.bit_length() - 2
+    IM = torch.fft.fft2(im) / (N * N)
+
+    cols = [IM[..., 0]]
+    for p in range(n):
+        b = 1 << p
+        cols.append(band(IM[..., b : 2 * b]))
+    cols.append(IM[..., m])
+    x = torch.stack(cols, dim=-1)
+
+    rows = []
+    for p in range(-n, n + 2):
+        if p == 0:
+            rows.append(x[..., 0, :])
+        elif p == n + 1:
+            rows.append(x[..., m, :])
+        else:
+            b = 1 << (abs(p) - 1)
+            sl = slice(b, 2 * b) if p > 0 else slice(N - 2 * b + 1, N - b + 1)
+            rows.append(band(x[..., sl, :].transpose(-2, -1)))
+
+    z = torch.stack(rows, dim=-2)
+    neg = torch.cat(
+        (
+            z[..., : 2 * n + 1, 1 : n + 1].flip((-2, -1)),
+            z[..., 2 * n + 1 :, 1 : n + 1].flip(-1),
+        ),
+        dim=-2,
+    ).conj()
+    return torch.cat((neg, z), dim=-1)
+
+
+@torch.no_grad()
+def embed(data, field, window, device):
+    voices = 2 * (window.bit_length() - 1)
+    channels = voices * voices
+
+    data = torch.as_tensor(data, dtype=torch.float32, device=device).contiguous()
+    wins = data.unfold(0, window, 1).unfold(1, window, 1)
+    out = torch.empty((field * field, channels), dtype=torch.complex64, device=device)
+    batch = max(1, (256 * 1024 * 1024) // (4 * window * window))
+
+    for i in range(0, len(out), batch):
+        j = min(i + batch, len(out))
+        indices = torch.arange(i, j, device=device)
+        x = wins[indices // field, indices % field]
+        x = x - x.mean((-1, -2), keepdim=True)
+        z = dost(x)
+        out[i:j] = z.reshape(j - i, channels)
+        del x, z
+
+    return out.reshape(field, field, channels).permute(2, 0, 1).contiguous()
+
+
+def shape(path):
+    with h5py.File(path, "r") as f:
+        window = int(f.attrs["w"])
+        patch = int(f.attrs["p"])
+        halo = int(f.attrs["h"])
+    voices = (2 * (window.bit_length() - 1)) ** 2
+    return voices, patch, window, halo
+
+
+def samples(path, batch, shuffle=False):
+    with h5py.File(path, "r") as f:
+        data = f["DATA"]
+        mask = f["MASK"]
+        patch = int(f.attrs["p"])
+        window = int(f.attrs["w"])
+        halo = int(f.attrs["h"])
+        field = patch + 2 * halo
+        order = list(range(data.shape[0]))
+
+        if shuffle:
+            random.shuffle(order)
+
+        for first in range(0, len(order), batch):
+            indices = order[first : first + batch]
+            x = torch.stack([embed(data[i], field, window, device) for i in indices])
+            y = torch.as_tensor(
+                np.stack([mask[i] for i in indices]),
+                dtype=torch.float32,
+                device=device,
+            )
+            yield x, y
+
+
+def posweight(path):
+    pos = 0
+    total = 0
+    with h5py.File(path, "r") as f:
+        mask = f["MASK"]
+        for y in mask:
+            pos += np.count_nonzero(y)
+            total += y.size
+    return (total - pos) / pos
+
+
 @torch.no_grad()
 def scale(path):
-    voices, _, window = shape(path)
+    voices, _, window, _ = shape(path)
     energy = torch.zeros(voices, dtype=torch.float64, device=device)
     count = 0
 
@@ -120,13 +207,20 @@ def scale(path):
     return sc
 
 
-def save(path, net, voices, patch, window):
+def core(logits, halo):
+    if halo == 0:
+        return logits
+    return logits[..., halo:-halo, halo:-halo]
+
+
+def save(path, net, voices, patch, window, halo):
     state = {k: v.detach().cpu() for k, v in net.state_dict().items()}
     torch.save(
         {
             "voices": voices,
             "n": patch,
             "w": window,
+            "h": halo,
             "preprocess": "center-dost-ortho-mean-rms-v1",
             "state": state,
         },
@@ -142,182 +236,19 @@ def load(path):
     voices = int(ckpt["voices"])
     patch = int(ckpt["n"])
     window = int(ckpt["w"])
+    halo = int(ckpt["h"])
     side = 2 * (window.bit_length() - 1)
     if side * side != voices:
-        raise ValueError("checkpoint voices and window disagree")
+        raise ValueError("voices and window mismatch")
     if patch < 16 or patch % 8:
-        raise ValueError("checkpoint patch size is invalid")
+        raise ValueError("invalid patch size")
+    if halo < 0 or halo % 8:
+        raise ValueError("invalid halo")
 
     net = Net(voices).to(device)
     net.load_state_dict(ckpt["state"])
     net.eval()
-    return net, patch, window
-
-
-def train(args):
-    parser = args.parser
-    voices, patch, window = shape(args.data)
-    if shape(args.validation) != (voices, patch, window):
-        parser.error("training and validation dimensions must match")
-    if patch < 16 or patch % 8:
-        parser.error("patch size must be a multiple of 8 and at least 16")
-
-    net = Net(voices).to(device)
-    net.scale.copy_(scale(args.data))
-    weight = torch.tensor(posweight(args.data), device=device)
-    opt = torch.optim.Adam(net.parameters(), lr=0.0003)
-    best = -1.0
-
-    for epoch in range(args.epochs):
-        net.train()
-        total = torch.zeros((), device=device)
-        count = 0
-
-        for x, y in samples(args.data, args.batch, shuffle=True):
-            opt.zero_grad(set_to_none=True)
-            logits = net(x)[:, 0]
-            loss = F.binary_cross_entropy_with_logits(
-                logits,
-                y,
-                pos_weight=weight,
-            )
-            loss.backward()
-            opt.step()
-
-            size = y.shape[0]
-            total += loss.detach() * size
-            count += size
-
-        train_loss = total.item() / count
-        iou = validate(net, args.validation, args.batch)
-        improved = iou > best
-
-        if improved:
-            save(args.model, net, voices, patch, window)
-            best = iou
-
-        print(
-            f"epoch={epoch + 1} loss={train_loss:.6f} "
-            f"val_iou={iou:.6f} best_iou={best:.6f} "
-            f"saved={int(improved)}",
-            file=sys.stderr,
-            flush=True,
-        )
-
-    return 0
-
-
-def dost(im, scale=0.5):
-    N = im.shape[-1]
-    m = N // 2
-    n = N.bit_length() - 2
-    IM = torch.fft.fft2(im) / (N * N)
-    S = torch.zeros_like(IM)
-
-    S[..., 0, 0] = IM[..., 0, 0]
-    S[..., 0, m] = IM[..., 0, m]
-    S[..., m, 0] = IM[..., m, 0]
-    S[..., m, m] = IM[..., m, m]
-
-    for py in range(n):
-        ny = 1 << py
-        pos = slice(ny, 2 * ny)
-        neg = slice(N - 2 * ny + 1, N - ny + 1)
-        rows = torch.stack(
-            (
-                IM[..., pos, 0],
-                IM[..., neg, 0],
-                IM[..., pos, m],
-                IM[..., neg, m],
-            )
-        )
-        rows = torch.fft.ifft(torch.fft.fftshift(rows, dim=-1), dim=-1)
-        rows = rows * (ny**scale)
-        S[..., pos, 0] = rows[0]
-        S[..., neg, 0] = rows[1].flip(-1)
-        S[..., pos, m] = rows[2]
-        S[..., neg, m] = rows[3].flip(-1)
-
-    for px in range(n):
-        nx = 1 << px
-        col = slice(nx, 2 * nx)
-        x = torch.fft.ifft(torch.fft.fftshift(IM[..., col], dim=-1), dim=-1)
-        x = x * (nx**scale)
-        S[..., 0, col] = x[..., 0, :]
-        S[..., m, col] = x[..., m, :]
-
-        for py in range(n):
-            ny = 1 << py
-            pos = slice(ny, 2 * ny)
-            neg = slice(N - 2 * ny + 1, N - ny + 1)
-            y = torch.stack((x[..., pos, :], x[..., neg, :]))
-            y = torch.fft.ifft(torch.fft.fftshift(y, dim=-2), dim=-2)
-            y = y * (ny**scale)
-            S[..., pos, col] = y[0]
-            S[..., neg, col] = y[1].flip(-2)
-
-    S[..., 1:m, m + 1 :] = S[..., m + 1 :, 1:m].flip(-1).flip(-2).conj()
-    S[..., m + 1 :, m + 1 :] = S[..., 1:m, 1:m].flip(-1).flip(-2).conj()
-    S[..., 0, m + 1 :] = S[..., 0, 1:m].flip(-1).conj()
-    S[..., m, m + 1 :] = S[..., m, 1:m].flip(-1).conj()
-    return S
-
-
-def ivoice(k, x, y, device):
-    n = k.bit_length() - 2
-    ix = []
-    iy = []
-
-    for p in range(-n, n + 2):
-        if p == 0:
-            bx = by = 0
-        elif p == n + 1:
-            bx = by = k // 2
-        else:
-            b = 1 << (abs(p) - 1)
-            tx = x * b // k
-            ty = y * b // k
-            if p > 0:
-                bx, by = b + tx, b + ty
-            else:
-                bx, by = k - b - tx, k - b - ty
-        ix.append(bx)
-        iy.append(by)
-
-    return (
-        torch.tensor(ix, dtype=torch.long, device=device),
-        torch.tensor(iy, dtype=torch.long, device=device),
-    )
-
-
-@torch.no_grad()
-def embed(data, patch, window, device):
-    half = window // 2
-    voices = 2 * (window.bit_length() - 1)
-    channels = voices * voices
-    ix, iy = ivoice(window, half, half, device)
-
-    data = torch.as_tensor(data, dtype=torch.float32, device=device)
-    data = data.contiguous()
-    wins = data.unfold(0, window, 1).unfold(1, window, 1)
-    out = torch.empty(
-        (patch * patch, channels),
-        dtype=torch.complex64,
-        device=device,
-    )
-    batch = max(1, (256 * 1024 * 1024) // (4 * window * window))
-
-    for i in range(0, len(out), batch):
-        j = min(i + batch, len(out))
-        indices = torch.arange(i, j, device=device)
-        x = wins[indices // patch, indices % patch]
-        x = x - x.mean((-1, -2), keepdim=True)
-        s = dost(x)
-        z = s.index_select(-2, ix).index_select(-1, iy)
-        out[i:j] = z.reshape(j - i, channels)
-        del x, s, z
-
-    return out.reshape(patch, patch, channels).permute(2, 0, 1).contiguous()
+    return net, patch, window, halo
 
 
 def annotations(path, shape, transform):
@@ -337,16 +268,16 @@ def annotations(path, shape, transform):
     )
 
 
-def tiles(bad, ann, patch, half, far):
+def tiles(bad, ann, patch, half, far, halo):
     height, width = ann.shape
     pos = []
     neg = []
 
-    for row in range(half, height - patch - far + 1, patch):
-        for col in range(half, width - patch - far + 1, patch):
+    for row in range(half + halo, height - patch - far - halo + 1, patch):
+        for col in range(half + halo, width - patch - far - halo + 1, patch):
             if bad[
-                row - half : row + patch + far,
-                col - half : col + patch + far,
+                row - halo - half : row + patch + halo + far,
+                col - halo - half : col + patch + halo + far,
             ].any():
                 continue
             if ann[row : row + patch, col : col + patch].any():
@@ -357,13 +288,13 @@ def tiles(bad, ann, patch, half, far):
     return pos, neg
 
 
-def partition(coords, axis, cut, patch, half, far):
+def partition(coords, axis, cut, patch, half, far, halo):
     training = []
     validation = []
 
     for coord in coords:
-        start = coord[axis] - half
-        stop = coord[axis] + patch + far
+        start = coord[axis] - halo - half
+        stop = coord[axis] + patch + halo + far
         if stop <= cut:
             training.append(coord)
         elif start >= cut:
@@ -372,13 +303,14 @@ def partition(coords, axis, cut, patch, half, far):
     return training, validation
 
 
-def write(path, dem, ann, coords, patch, half, far):
-    size = patch + half + far
+def write(path, dem, ann, coords, patch, half, far, halo):
+    size = patch + 2 * halo + half + far
     count = len(coords)
 
     with h5py.File(path, "x") as dst:
         dst.attrs["p"] = patch
         dst.attrs["w"] = half + far + 1
+        dst.attrs["h"] = halo
         data = dst.create_dataset(
             "DATA",
             shape=(count, size, size),
@@ -396,8 +328,8 @@ def write(path, dem, ann, coords, patch, half, far):
         )
         for i, (row, col) in enumerate(coords):
             data[i] = dem[
-                row - half : row + patch + far,
-                col - half : col + patch + far,
+                row - halo - half : row + patch + halo + far,
+                col - halo - half : col + patch + halo + far,
             ]
             mask[i] = ann[row : row + patch, col : col + patch]
 
@@ -406,7 +338,9 @@ def prepare(args):
     parser = args.parser
     if args.patch % 8:
         parser.error("patch size must be a multiple of 8")
-    if args.data.resolve() == args.validation.resolve():
+    if args.halo < 0 or args.halo % 8:
+        parser.error("halo must be a nonnegative multiple of 8")
+    if args.train.resolve() == args.val.resolve():
         parser.error("training and validation outputs must differ")
 
     half, far = margin(args.window)
@@ -415,38 +349,29 @@ def prepare(args):
         raster = src.read(1, masked=True)
         dem = np.asarray(raster.data, dtype=np.float32)
         bad = np.ma.getmaskarray(raster) | ~np.isfinite(raster.data)
-        ann = annotations(
-            args.annotation,
-            (src.height, src.width),
-            src.transform,
-        )
+        ann = annotations(args.annotation, (src.height, src.width), src.transform)
 
-    pos, neg = tiles(bad, ann, args.patch, half, far)
+    pos, neg = tiles(bad, ann, args.patch, half, far, args.halo)
     target = int(len(pos) * args.ratio)
     if not 0 < target < len(pos):
-        parser.error(
-            "ratio and annotated patch count must leave "
-            "at least one annotated patch in each set"
-        )
+        parser.error("ratio leaves no annotated patches in one split")
 
     height, width = ann.shape
     axis = 1 if width >= height else 0
     ordered = sorted(pos, key=lambda coord: coord[axis])
-    cut = ordered[-target][axis] - half
+    cut = ordered[-target][axis] - args.halo - half
 
-    train_pos, val_pos = partition(pos, axis, cut, args.patch, half, far)
-    train_neg, val_neg = partition(neg, axis, cut, args.patch, half, far)
+    train_pos, val_pos = partition(pos, axis, cut, args.patch, half, far, args.halo)
+    train_neg, val_neg = partition(neg, axis, cut, args.patch, half, far, args.halo)
 
     if not train_pos:
-        parser.error("training region has no eligible annotated patches")
+        parser.error("no annotated patches in training split")
     if not val_pos:
-        parser.error("validation region has no eligible annotated patches")
+        parser.error("no annotated patches in validation split")
     if len(train_neg) < len(train_pos):
-        parser.error("training region has insufficient empty patches for 1:1 balancing")
+        parser.error("insufficient empty patches in training split")
     if len(val_neg) < len(val_pos):
-        parser.error(
-            "validation region has insufficient empty patches for 1:1 balancing"
-        )
+        parser.error("insufficient empty patches in validation split")
 
     rng = random.Random(0)
     training = train_pos + rng.sample(train_neg, len(train_pos))
@@ -454,8 +379,8 @@ def prepare(args):
     rng.shuffle(training)
     rng.shuffle(validation)
 
-    write(args.data, dem, ann, training, args.patch, half, far)
-    write(args.validation, dem, ann, validation, args.patch, half, far)
+    write(args.train, dem, ann, training, args.patch, half, far, args.halo)
+    write(args.val, dem, ann, validation, args.patch, half, far, args.halo)
 
     dropped_pos = len(pos) - len(train_pos) - len(val_pos)
     dropped_neg = len(neg) - len(train_neg) - len(val_neg)
@@ -469,84 +394,81 @@ def prepare(args):
     )
     print(f"crossing annotated={dropped_pos} empty={dropped_neg}")
     print(
-        f"training annotated={len(train_pos)} "
-        f"empty={len(train_pos)} total={len(training)}"
+        f"training annotated={len(train_pos)} empty={len(train_pos)} total={len(training)}"
     )
     print(
-        f"validation annotated={len(val_pos)} "
-        f"empty={len(val_pos)} total={len(validation)}"
+        f"validation annotated={len(val_pos)} empty={len(val_pos)} total={len(validation)}"
     )
     return 0
 
 
-def shape(path):
-    with h5py.File(path, "r") as f:
-        window = int(f.attrs["w"])
-        patch = int(f.attrs["p"])
-    voices = (2 * (window.bit_length() - 1)) ** 2
-    return voices, patch, window
-
-
-def samples(path, batch, shuffle=False):
-    with h5py.File(path, "r") as f:
-        data = f["DATA"]
-        mask = f["MASK"]
-        patch = int(f.attrs["p"])
-        window = int(f.attrs["w"])
-        order = list(range(data.shape[0]))
-
-        if shuffle:
-            random.shuffle(order)
-
-        for first in range(0, len(order), batch):
-            indices = order[first : first + batch]
-            x = torch.stack([embed(data[i], patch, window, device) for i in indices])
-            y = torch.as_tensor(
-                np.stack([mask[i] for i in indices]),
-                dtype=torch.float32,
-                device=device,
-            )
-            yield x, y
-
-
-def posweight(path):
-    pos = 0
-    total = 0
-
-    with h5py.File(path, "r") as f:
-        mask = f["MASK"]
-        for y in mask:
-            pos += np.count_nonzero(y)
-            total += y.size
-
-    return (total - pos) / pos
-
-
 @torch.no_grad()
-def validate(net, path, batch):
+def validate(net, path, batch, halo):
     net.eval()
     intersection = 0
     union = 0
 
     for x, y in samples(path, batch):
-        pred = net(x)[:, 0] >= 0
+        pred = core(net(x)[:, 0], halo) >= 0
         truth = y != 0
         intersection += (pred & truth).sum().item()
         union += (pred | truth).sum().item()
 
     if union == 0:
-        raise ValueError("validation IoU is undefined: empty union")
+        raise ValueError("validation IoU undefined: empty union")
 
     return intersection / union
 
 
-def window_from_voices(voices):
-    side = 1
-    while side * side < voices:
-        side += 1
-    if side * side != voices or side % 2:
-        raise ValueError("cannot recover window from voices")
-    return 1 << (side // 2)
+def train(args):
+    parser = args.parser
+    voices, patch, window, halo = shape(args.train)
+    if shape(args.val) != (voices, patch, window, halo):
+        parser.error("training and validation dimensions must match")
+    if patch < 16 or patch % 8:
+        parser.error("patch size must be >= 16 and a multiple of 8")
+    if halo < 0 or halo % 8:
+        parser.error("halo must be a nonnegative multiple of 8")
+
+    net = Net(voices).to(device)
+    net.scale.copy_(scale(args.train))
+    weight = torch.tensor(posweight(args.train), device=device)
+    opt = torch.optim.Adam(net.parameters(), lr=0.0003)
+    best = -1.0
+
+    for epoch in range(args.epochs):
+        net.train()
+        total = torch.zeros((), device=device)
+        count = 0
+
+        for x, y in samples(args.train, args.batch, shuffle=True):
+            opt.zero_grad(set_to_none=True)
+            logits = core(net(x)[:, 0], halo)
+            loss = F.binary_cross_entropy_with_logits(logits, y, pos_weight=weight)
+            loss.backward()
+            opt.step()
+
+            size = y.shape[0]
+            total += loss.detach() * size
+            count += size
+
+        train_loss = total.item() / count
+        iou = validate(net, args.val, args.batch, halo)
+        improved = iou > best
+
+        if improved:
+            save(args.model, net, voices, patch, window, halo)
+            best = iou
+
+        print(
+            f"epoch={epoch + 1} loss={train_loss:.6f} "
+            f"val_iou={iou:.6f} best_iou={best:.6f} "
+            f"saved={int(improved)}",
+            file=sys.stderr,
+            flush=True,
+        )
+
+    return 0
 
 
 def origins(lo, hi, step):
@@ -559,36 +481,27 @@ def origins(lo, hi, step):
 
 
 @torch.no_grad()
-def masks(net, dem, bad, patch, window):
+def masks(net, dem, bad, patch, window, halo):
     half, far = margin(window)
     height, width = dem.shape
     out = np.full((height, width), 255, np.uint8)
-    rows = origins(half, height - patch - far, patch)
-    cols = origins(half, width - patch - far, patch)
+    rows = origins(half + halo, height - patch - far - halo, patch)
+    cols = origins(half + halo, width - patch - far - halo, patch)
     done = 0
     skipped = 0
 
     for row in rows:
         for col in cols:
-            if bad[
-                row - half : row + patch + far,
-                col - half : col + patch + far,
-            ].any():
+            r0 = row - halo - half
+            c0 = col - halo - half
+            r1 = row + patch + halo + far
+            c1 = col + patch + halo + far
+            if bad[r0:r1, c0:c1].any():
                 skipped += 1
                 continue
-            x = embed(
-                dem[
-                    row - half : row + patch + far,
-                    col - half : col + patch + far,
-                ],
-                patch,
-                window,
-                device,
-            )
-            pred = (net(x.unsqueeze(0))[0, 0] >= 0).cpu().numpy()
-            tile = out[row : row + patch, col : col + patch]
-            fill = tile == 255
-            tile[fill] = pred[fill]
+            x = embed(dem[r0:r1, c0:c1], patch + 2 * halo, window, device)
+            pred = (core(net(x.unsqueeze(0))[0, 0], halo) >= 0).cpu().numpy()
+            out[row : row + patch, col : col + patch] = pred
             done += 1
 
     return out, done, skipped, len(rows) * len(cols)
@@ -596,9 +509,11 @@ def masks(net, dem, bad, patch, window):
 
 def predict(args):
     parser = args.parser
-    net, patch, window = load(args.model)
+    net, patch, window, halo = load(args.model)
     if patch % 8:
         parser.error("checkpoint patch size must be a multiple of 8")
+    if halo < 0 or halo % 8:
+        parser.error("checkpoint halo must be a nonnegative multiple of 8")
 
     with rasterio.open(args.dem) as src:
         raster = src.read(1, masked=True)
@@ -616,83 +531,75 @@ def predict(args):
             "compress": "deflate",
         }
 
-    need = patch + window - 1
+    need = patch + 2 * halo + window - 1
     if dem.shape[0] < need or dem.shape[1] < need:
-        parser.error("raster is smaller than one context")
+        parser.error("raster smaller than patch + halo + window")
 
-    mask, done, skipped, total = masks(net, dem, bad, patch, window)
+    mask, done, skipped, total = masks(net, dem, bad, patch, window, halo)
     with rasterio.open(args.mask, "w", **profile) as dst:
         dst.write(mask, 1)
 
-    print(f"patch={patch} window={window} tiles={done} skipped={skipped} total={total}")
+    print(
+        f"patch={patch} window={window} halo={halo} "
+        f"tiles={done} skipped={skipped} total={total}"
+    )
     return 0
+
+
+def fraction(value):
+    n = float(value)
+    if not 0 < n < 1:
+        raise argparse.ArgumentTypeError("must be between 0 and 1")
+    return n
+
+
+def positive(value):
+    n = int(value)
+    if n < 1:
+        raise argparse.ArgumentTypeError("must be positive")
+    return n
+
+
+def nonnegative(value):
+    n = int(value)
+    if n < 0:
+        raise argparse.ArgumentTypeError("must be nonnegative")
+    return n
+
+
+def powersz(value):
+    n = positive(value)
+    if n < 2 or n & (n - 1):
+        raise argparse.ArgumentTypeError("must be a power of two")
+    return n
 
 
 def main(argv=None):
     parser = argparse.ArgumentParser(prog="laslnet")
     sub = parser.add_subparsers(dest="cmd", required=True)
 
-    p = sub.add_parser(
-        "prepare",
-        help="build spatially separated, balanced contexts",
-        description="prepare spatially separated, balanced DEM contexts",
-    )
+    p = sub.add_parser("prepare", help="prepare balanced HDF5 contexts")
+    p.add_argument("-p", dest="patch", type=positive, default=128, help="patch size")
+    p.add_argument("-w", dest="window", type=powersz, default=128, help="window size")
+    p.add_argument("-H", dest="halo", type=nonnegative, default=16, help="feature halo")
     p.add_argument(
-        "-p",
-        dest="patch",
-        type=positive,
-        default=128,
-        help="output patch size",
+        "-v", dest="ratio", type=fraction, default=0.2, help="validation ratio"
     )
-    p.add_argument(
-        "-w",
-        dest="window",
-        type=powersz,
-        default=128,
-        help="DOST window size",
-    )
-    p.add_argument(
-        "-v",
-        dest="ratio",
-        type=fraction,
-        default=0.2,
-        help="target validation fraction of annotated patches",
-    )
-    p.add_argument("dem", type=Path, help="elevation raster")
-    p.add_argument("annotation", type=Path, help="annotation vectors")
-    p.add_argument("data", type=Path, help="training contexts")
-    p.add_argument("validation", type=Path, help="validation contexts")
+    p.add_argument("dem", type=Path, help="input elevation raster")
+    p.add_argument("annotation", type=Path, help="input annotation vectors")
+    p.add_argument("train", type=Path, help="output training contexts (h5)")
+    p.add_argument("val", type=Path, help="output validation contexts (h5)")
     p.set_defaults(func=prepare, parser=p)
 
-    t = sub.add_parser(
-        "train",
-        help="train a landslide detector",
-        description="train a landslide detector",
-    )
-    t.add_argument(
-        "-b",
-        dest="batch",
-        type=positive,
-        default=8,
-        help="training and validation batch size",
-    )
-    t.add_argument(
-        "-e",
-        dest="epochs",
-        type=positive,
-        default=20,
-        help="training epochs",
-    )
-    t.add_argument("data", type=Path, help="training contexts")
-    t.add_argument("validation", type=Path, help="validation contexts")
+    t = sub.add_parser("train", help="train detector")
+    t.add_argument("-b", dest="batch", type=positive, default=8, help="batch size")
+    t.add_argument("-e", dest="epochs", type=positive, default=20, help="epochs")
+    t.add_argument("train", type=Path, help="training contexts (h5)")
+    t.add_argument("val", type=Path, help="validation contexts (h5)")
     t.add_argument("model", type=Path, help="output model")
     t.set_defaults(func=train, parser=t)
 
-    g = sub.add_parser(
-        "predict",
-        help="write a landslide mask",
-        description="predict landslides; 1 where logit >= 0, 255 is nodata",
-    )
+    g = sub.add_parser("predict", help="predict landslide mask")
     g.add_argument("model", type=Path, help="trained model")
     g.add_argument("dem", type=Path, help="elevation raster")
     g.add_argument("mask", type=Path, help="output mask")
