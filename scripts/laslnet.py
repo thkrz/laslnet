@@ -53,12 +53,22 @@ class modReLU(nn.Module):
         return z * s
 
 
+class ReflectConv(nn.Module):
+    def __init__(self, cin, cout, stride=1):
+        super().__init__()
+        self.conv = nn.Conv2d(cin, cout, 3, stride=stride, dtype=torch.complex64)
+
+    def forward(self, x):
+        real = F.pad(x.real, (1, 1, 1, 1), mode="reflect")
+        imag = F.pad(x.imag, (1, 1, 1, 1), mode="reflect")
+        return self.conv(torch.complex(real, imag))
+
+
 def block(cin, cout, stride=1):
-    c = torch.complex64
     return nn.Sequential(
-        nn.Conv2d(cin, cout, 3, stride=stride, padding=1, dtype=c),
+        ReflectConv(cin, cout, stride),
         modReLU(cout),
-        nn.Conv2d(cout, cout, 3, padding=1, dtype=c),
+        ReflectConv(cout, cout),
         modReLU(cout),
     )
 
@@ -67,6 +77,7 @@ class Net(nn.Module):
     def __init__(self, voices):
         super().__init__()
         c = torch.complex64
+        self.register_buffer("scale", torch.ones(voices))
         self.e1 = block(voices, 64)
         self.e2 = block(64, 128, 2)
         self.e3 = block(128, 256, 2)
@@ -80,6 +91,7 @@ class Net(nn.Module):
         self.head = nn.Conv2d(128, 1, 1)
 
     def forward(self, x):
+        x = x / self.scale.view(1, -1, 1, 1)
         x1 = self.e1(x)
         x2 = self.e2(x1)
         x3 = self.e3(x2)
@@ -90,54 +102,200 @@ class Net(nn.Module):
         return self.head(torch.cat((x.real, x.imag), 1))
 
 
-def band(a):
-    b = a.shape[-1]
-    z = (a[..., ::2].sum(-1) - a[..., 1::2].sum(-1)) * (b**-0.5)
-    return -z if b == 2 else z
+@torch.no_grad()
+def scale(path):
+    voices, _, window = shape(path)
+    energy = torch.zeros(voices, dtype=torch.float64, device=device)
+    count = 0
+
+    for x, _ in samples(path, 1):
+        energy += x.abs().square().sum((0, 2, 3), dtype=torch.float64)
+        count += x.shape[0] * x.shape[2] * x.shape[3]
+
+    sc = (energy / count).sqrt().float()
+    sc[sc < 1e-6] = 1
+    side = 2 * (window.bit_length() - 1)
+    dc = side // 2 - 1
+    sc[dc * side + dc] = 1
+    return sc
 
 
-def dost(im):
+def save(path, net, voices, patch, window):
+    state = {k: v.detach().cpu() for k, v in net.state_dict().items()}
+    torch.save(
+        {
+            "voices": voices,
+            "n": patch,
+            "w": window,
+            "preprocess": "center-dost-ortho-mean-rms-v1",
+            "state": state,
+        },
+        path,
+    )
+
+
+def load(path):
+    ckpt = torch.load(path, map_location=device, weights_only=True)
+    if ckpt.get("preprocess") != "center-dost-ortho-mean-rms-v1":
+        raise ValueError("unsupported checkpoint preprocessing")
+
+    voices = int(ckpt["voices"])
+    patch = int(ckpt["n"])
+    window = int(ckpt["w"])
+    side = 2 * (window.bit_length() - 1)
+    if side * side != voices:
+        raise ValueError("checkpoint voices and window disagree")
+    if patch < 16 or patch % 8:
+        raise ValueError("checkpoint patch size is invalid")
+
+    net = Net(voices).to(device)
+    net.load_state_dict(ckpt["state"])
+    net.eval()
+    return net, patch, window
+
+
+def train(args):
+    parser = args.parser
+    voices, patch, window = shape(args.data)
+    if shape(args.validation) != (voices, patch, window):
+        parser.error("training and validation dimensions must match")
+    if patch < 16 or patch % 8:
+        parser.error("patch size must be a multiple of 8 and at least 16")
+
+    net = Net(voices).to(device)
+    net.scale.copy_(scale(args.data))
+    weight = torch.tensor(posweight(args.data), device=device)
+    opt = torch.optim.Adam(net.parameters(), lr=0.0003)
+    best = -1.0
+
+    for epoch in range(args.epochs):
+        net.train()
+        total = torch.zeros((), device=device)
+        count = 0
+
+        for x, y in samples(args.data, args.batch, shuffle=True):
+            opt.zero_grad(set_to_none=True)
+            logits = net(x)[:, 0]
+            loss = F.binary_cross_entropy_with_logits(
+                logits,
+                y,
+                pos_weight=weight,
+            )
+            loss.backward()
+            opt.step()
+
+            size = y.shape[0]
+            total += loss.detach() * size
+            count += size
+
+        train_loss = total.item() / count
+        iou = validate(net, args.validation, args.batch)
+        improved = iou > best
+
+        if improved:
+            save(args.model, net, voices, patch, window)
+            best = iou
+
+        print(
+            f"epoch={epoch + 1} loss={train_loss:.6f} "
+            f"val_iou={iou:.6f} best_iou={best:.6f} "
+            f"saved={int(improved)}",
+            file=sys.stderr,
+            flush=True,
+        )
+
+    return 0
+
+
+def dost(im, scale=0.5):
     N = im.shape[-1]
     m = N // 2
     n = N.bit_length() - 2
     IM = torch.fft.fft2(im) / (N * N)
+    S = torch.zeros_like(IM)
 
-    cols = [IM[..., 0]]
-    for p in range(n):
-        b = 1 << p
-        cols.append(band(IM[..., b : 2 * b]))
-    cols.append(IM[..., m])
-    x = torch.stack(cols, dim=-1)
+    S[..., 0, 0] = IM[..., 0, 0]
+    S[..., 0, m] = IM[..., 0, m]
+    S[..., m, 0] = IM[..., m, 0]
+    S[..., m, m] = IM[..., m, m]
 
-    rows = []
+    for py in range(n):
+        ny = 1 << py
+        pos = slice(ny, 2 * ny)
+        neg = slice(N - 2 * ny + 1, N - ny + 1)
+        rows = torch.stack(
+            (
+                IM[..., pos, 0],
+                IM[..., neg, 0],
+                IM[..., pos, m],
+                IM[..., neg, m],
+            )
+        )
+        rows = torch.fft.ifft(torch.fft.fftshift(rows, dim=-1), dim=-1)
+        rows = rows * (ny**scale)
+        S[..., pos, 0] = rows[0]
+        S[..., neg, 0] = rows[1].flip(-1)
+        S[..., pos, m] = rows[2]
+        S[..., neg, m] = rows[3].flip(-1)
+
+    for px in range(n):
+        nx = 1 << px
+        col = slice(nx, 2 * nx)
+        x = torch.fft.ifft(torch.fft.fftshift(IM[..., col], dim=-1), dim=-1)
+        x = x * (nx**scale)
+        S[..., 0, col] = x[..., 0, :]
+        S[..., m, col] = x[..., m, :]
+
+        for py in range(n):
+            ny = 1 << py
+            pos = slice(ny, 2 * ny)
+            neg = slice(N - 2 * ny + 1, N - ny + 1)
+            y = torch.stack((x[..., pos, :], x[..., neg, :]))
+            y = torch.fft.ifft(torch.fft.fftshift(y, dim=-2), dim=-2)
+            y = y * (ny**scale)
+            S[..., pos, col] = y[0]
+            S[..., neg, col] = y[1].flip(-2)
+
+    S[..., 1:m, m + 1 :] = S[..., m + 1 :, 1:m].flip(-1).flip(-2).conj()
+    S[..., m + 1 :, m + 1 :] = S[..., 1:m, 1:m].flip(-1).flip(-2).conj()
+    S[..., 0, m + 1 :] = S[..., 0, 1:m].flip(-1).conj()
+    S[..., m, m + 1 :] = S[..., m, 1:m].flip(-1).conj()
+    return S
+
+
+def ivoice(k, x, y, device):
+    n = k.bit_length() - 2
+    ix = []
+    iy = []
+
     for p in range(-n, n + 2):
         if p == 0:
-            rows.append(x[..., 0, :])
+            bx = by = 0
         elif p == n + 1:
-            rows.append(x[..., m, :])
+            bx = by = k // 2
         else:
             b = 1 << (abs(p) - 1)
+            tx = x * b // k
+            ty = y * b // k
             if p > 0:
-                sl = slice(b, 2 * b)
+                bx, by = b + tx, b + ty
             else:
-                sl = slice(N - 2 * b + 1, N - b + 1)
-            rows.append(band(x[..., sl, :].transpose(-2, -1)))
+                bx, by = k - b - tx, k - b - ty
+        ix.append(bx)
+        iy.append(by)
 
-    z = torch.stack(rows, dim=-2)
-    neg = torch.cat(
-        (
-            z[..., : 2 * n + 1, 1 : n + 1].flip((-2, -1)),
-            z[..., 2 * n + 1 :, 1 : n + 1].flip(-1),
-        ),
-        dim=-2,
-    ).conj()
-    return torch.cat((neg, z), dim=-1)
+    return (
+        torch.tensor(ix, dtype=torch.long, device=device),
+        torch.tensor(iy, dtype=torch.long, device=device),
+    )
 
 
 @torch.no_grad()
 def embed(data, patch, window, device):
+    half = window // 2
     voices = 2 * (window.bit_length() - 1)
     channels = voices * voices
+    ix, iy = ivoice(window, half, half, device)
 
     data = torch.as_tensor(data, dtype=torch.float32, device=device)
     data = data.contiguous()
@@ -154,9 +312,10 @@ def embed(data, patch, window, device):
         indices = torch.arange(i, j, device=device)
         x = wins[indices // patch, indices % patch]
         x = x - x.mean((-1, -2), keepdim=True)
-        z = dost(x)
+        s = dost(x)
+        z = s.index_select(-2, ix).index_select(-1, iy)
         out[i:j] = z.reshape(j - i, channels)
-        del x, z
+        del x, s, z
 
     return out.reshape(patch, patch, channels).permute(2, 0, 1).contiguous()
 
@@ -381,14 +540,6 @@ def validate(net, path, batch):
     return intersection / union
 
 
-def save(path, net, voices, patch, window):
-    state = {k: v.detach().cpu() for k, v in net.state_dict().items()}
-    torch.save(
-        {"voices": voices, "n": patch, "w": window, "state": state},
-        path,
-    )
-
-
 def window_from_voices(voices):
     side = 1
     while side * side < voices:
@@ -396,73 +547,6 @@ def window_from_voices(voices):
     if side * side != voices or side % 2:
         raise ValueError("cannot recover window from voices")
     return 1 << (side // 2)
-
-
-def load(path):
-    ckpt = torch.load(path, map_location=device, weights_only=True)
-    voices = int(ckpt["voices"])
-    patch = int(ckpt["n"])
-    if "w" in ckpt:
-        window = int(ckpt["w"])
-    else:
-        window = window_from_voices(voices)
-    side = 2 * (window.bit_length() - 1)
-    if side * side != voices:
-        raise ValueError("checkpoint voices and window disagree")
-    net = Net(voices).to(device)
-    net.load_state_dict(ckpt["state"])
-    net.eval()
-    return net, patch, window
-
-
-def train(args):
-    parser = args.parser
-    voices, patch, window = shape(args.data)
-    if shape(args.validation) != (voices, patch, window):
-        parser.error("training and validation dimensions must match")
-
-    weight = torch.tensor(posweight(args.data), device=device)
-    net = Net(voices).to(device)
-    opt = torch.optim.Adam(net.parameters(), lr=0.0003)
-    best = -1.0
-
-    for epoch in range(args.epochs):
-        net.train()
-        total = torch.zeros((), device=device)
-        count = 0
-
-        for x, y in samples(args.data, args.batch, shuffle=True):
-            opt.zero_grad(set_to_none=True)
-            logits = net(x)[:, 0]
-            loss = F.binary_cross_entropy_with_logits(
-                logits,
-                y,
-                pos_weight=weight,
-            )
-            loss.backward()
-            opt.step()
-
-            size = y.shape[0]
-            total += loss.detach() * size
-            count += size
-
-        train_loss = total.item() / count
-        iou = validate(net, args.validation, args.batch)
-        improved = iou > best
-
-        if improved:
-            save(args.model, net, voices, patch, window)
-            best = iou
-
-        print(
-            f"epoch={epoch + 1} loss={train_loss:.6f} "
-            f"val_iou={iou:.6f} best_iou={best:.6f} "
-            f"saved={int(improved)}",
-            file=sys.stderr,
-            flush=True,
-        )
-
-    return 0
 
 
 def origins(lo, hi, step):
