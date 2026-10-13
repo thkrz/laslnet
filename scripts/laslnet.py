@@ -16,65 +16,24 @@ from torch.nn import functional as F
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
-class modReLU(nn.Module):
-    def __init__(self, channels):
-        super().__init__()
-        self.bias = nn.Parameter(torch.full((channels,), -0.1))
-
-    def forward(self, z):
-        m = z.abs()
-        b = self.bias.view(1, -1, 1, 1)
-        s = F.relu(m + b) / m.clamp_min(1e-8)
-        return z * s
-
-
-class ReflectConv(nn.Module):
-    def __init__(self, cin, cout, stride=1):
-        super().__init__()
-        self.conv = nn.Conv2d(cin, cout, 3, stride=stride, dtype=torch.complex64)
-
-    def forward(self, x):
-        real = F.pad(x.real, (1, 1, 1, 1), mode="reflect")
-        imag = F.pad(x.imag, (1, 1, 1, 1), mode="reflect")
-        return self.conv(torch.complex(real, imag))
-
-
-def block(cin, cout, stride=1):
-    return nn.Sequential(
-        ReflectConv(cin, cout, stride),
-        modReLU(cout),
-        ReflectConv(cout, cout),
-        modReLU(cout),
-    )
-
-
 class Net(nn.Module):
     def __init__(self, voices):
         super().__init__()
-        c = torch.complex64
         self.register_buffer("scale", torch.ones(voices))
-        self.e1 = block(voices, 64)
-        self.e2 = block(64, 128, 2)
-        self.e3 = block(128, 256, 2)
-        self.b = block(256, 512, 2)
-        self.up3 = nn.ConvTranspose2d(512, 256, 2, stride=2, dtype=c)
-        self.d3 = block(512, 256)
-        self.up2 = nn.ConvTranspose2d(256, 128, 2, stride=2, dtype=c)
-        self.d2 = block(256, 128)
-        self.up1 = nn.ConvTranspose2d(128, 64, 2, stride=2, dtype=c)
-        self.d1 = block(128, 64)
-        self.head = nn.Conv2d(128, 1, 1)
+        self.layers = nn.Sequential(
+            nn.Conv2d(2 * voices, 32, 1),
+            nn.ReLU(),
+            nn.Conv2d(32, 32, 3, padding=1),
+            nn.ReLU(),
+            nn.Conv2d(32, 32, 3, padding=1),
+            nn.ReLU(),
+            nn.Conv2d(32, 1, 1),
+        )
 
     def forward(self, x):
         x = x / self.scale.view(1, -1, 1, 1)
-        x1 = self.e1(x)
-        x2 = self.e2(x1)
-        x3 = self.e3(x2)
-        x = self.b(x3)
-        x = self.d3(torch.cat((self.up3(x), x3), 1))
-        x = self.d2(torch.cat((self.up2(x), x2), 1))
-        x = self.d1(torch.cat((self.up1(x), x1), 1))
-        return self.head(torch.cat((x.real, x.imag), 1))
+        x = torch.cat((x.real, x.imag), dim=1)
+        return self.layers(x)
 
 
 def margin(window):
@@ -154,10 +113,11 @@ def shape(path):
     return voices, patch, window, halo
 
 
-def samples(path, batch, shuffle=False):
+def samples(path, split, batch, shuffle=False):
     with h5py.File(path, "r") as f:
-        data = f["DATA"]
-        mask = f["MASK"]
+        group = f[split]
+        data = group["DATA"]
+        mask = group["MASK"]
         patch = int(f.attrs["p"])
         window = int(f.attrs["w"])
         halo = int(f.attrs["h"])
@@ -182,7 +142,7 @@ def posweight(path):
     pos = 0
     total = 0
     with h5py.File(path, "r") as f:
-        mask = f["MASK"]
+        mask = f["train"]["MASK"]
         for y in mask:
             pos += np.count_nonzero(y)
             total += y.size
@@ -195,7 +155,7 @@ def scale(path):
     energy = torch.zeros(voices, dtype=torch.float64, device=device)
     count = 0
 
-    for x, _ in samples(path, 1):
+    for x, _ in samples(path, "train", 1):
         energy += x.abs().square().sum((0, 2, 3), dtype=torch.float64)
         count += x.shape[0] * x.shape[2] * x.shape[3]
 
@@ -303,35 +263,30 @@ def partition(coords, axis, cut, patch, half, far, halo):
     return training, validation
 
 
-def write(path, dem, ann, coords, patch, half, far, halo):
+def write(group, dem, ann, coords, patch, half, far, halo):
     size = patch + 2 * halo + half + far
     count = len(coords)
-
-    with h5py.File(path, "x") as dst:
-        dst.attrs["p"] = patch
-        dst.attrs["w"] = half + far + 1
-        dst.attrs["h"] = halo
-        data = dst.create_dataset(
-            "DATA",
-            shape=(count, size, size),
-            dtype=np.float32,
-            chunks=(1, size, size),
-            compression="gzip",
-            shuffle=True,
-        )
-        mask = dst.create_dataset(
-            "MASK",
-            shape=(count, patch, patch),
-            dtype=np.uint8,
-            chunks=(1, patch, patch),
-            compression="gzip",
-        )
-        for i, (row, col) in enumerate(coords):
-            data[i] = dem[
-                row - halo - half : row + patch + halo + far,
-                col - halo - half : col + patch + halo + far,
-            ]
-            mask[i] = ann[row : row + patch, col : col + patch]
+    data = group.create_dataset(
+        "DATA",
+        shape=(count, size, size),
+        dtype=np.float32,
+        chunks=(1, size, size),
+        compression="gzip",
+        shuffle=True,
+    )
+    mask = group.create_dataset(
+        "MASK",
+        shape=(count, patch, patch),
+        dtype=np.uint8,
+        chunks=(1, patch, patch),
+        compression="gzip",
+    )
+    for i, (row, col) in enumerate(coords):
+        data[i] = dem[
+            row - halo - half : row + patch + halo + far,
+            col - halo - half : col + patch + halo + far,
+        ]
+        mask[i] = ann[row : row + patch, col : col + patch]
 
 
 def prepare(args):
@@ -340,8 +295,6 @@ def prepare(args):
         parser.error("patch size must be a multiple of 8")
     if args.halo < 0 or args.halo % 8:
         parser.error("halo must be a nonnegative multiple of 8")
-    if args.train.resolve() == args.val.resolve():
-        parser.error("training and validation outputs must differ")
 
     half, far = margin(args.window)
 
@@ -379,8 +332,30 @@ def prepare(args):
     rng.shuffle(training)
     rng.shuffle(validation)
 
-    write(args.train, dem, ann, training, args.patch, half, far, args.halo)
-    write(args.val, dem, ann, validation, args.patch, half, far, args.halo)
+    with h5py.File(args.context, "x") as dst:
+        dst.attrs["p"] = args.patch
+        dst.attrs["w"] = half + far + 1
+        dst.attrs["h"] = args.halo
+        write(
+            dst.create_group("train"),
+            dem,
+            ann,
+            training,
+            args.patch,
+            half,
+            far,
+            args.halo,
+        )
+        write(
+            dst.create_group("val"),
+            dem,
+            ann,
+            validation,
+            args.patch,
+            half,
+            far,
+            args.halo,
+        )
 
     dropped_pos = len(pos) - len(train_pos) - len(val_pos)
     dropped_neg = len(neg) - len(train_neg) - len(val_neg)
@@ -408,7 +383,7 @@ def validate(net, path, batch, halo):
     intersection = 0
     union = 0
 
-    for x, y in samples(path, batch):
+    for x, y in samples(path, "val", batch):
         pred = core(net(x)[:, 0], halo) >= 0
         truth = y != 0
         intersection += (pred & truth).sum().item()
@@ -422,17 +397,15 @@ def validate(net, path, batch, halo):
 
 def train(args):
     parser = args.parser
-    voices, patch, window, halo = shape(args.train)
-    if shape(args.val) != (voices, patch, window, halo):
-        parser.error("training and validation dimensions must match")
+    voices, patch, window, halo = shape(args.context)
     if patch < 16 or patch % 8:
         parser.error("patch size must be >= 16 and a multiple of 8")
     if halo < 0 or halo % 8:
         parser.error("halo must be a nonnegative multiple of 8")
 
     net = Net(voices).to(device)
-    net.scale.copy_(scale(args.train))
-    weight = torch.tensor(posweight(args.train), device=device)
+    net.scale.copy_(scale(args.context))
+    weight = torch.tensor(posweight(args.context), device=device)
     opt = torch.optim.Adam(net.parameters(), lr=0.0003)
     best = -1.0
 
@@ -441,7 +414,7 @@ def train(args):
         total = torch.zeros((), device=device)
         count = 0
 
-        for x, y in samples(args.train, args.batch, shuffle=True):
+        for x, y in samples(args.context, "train", args.batch, shuffle=True):
             opt.zero_grad(set_to_none=True)
             logits = core(net(x)[:, 0], halo)
             loss = F.binary_cross_entropy_with_logits(logits, y, pos_weight=weight)
@@ -453,7 +426,7 @@ def train(args):
             count += size
 
         train_loss = total.item() / count
-        iou = validate(net, args.val, args.batch, halo)
+        iou = validate(net, args.context, args.batch, halo)
         improved = iou > best
 
         if improved:
@@ -579,23 +552,39 @@ def main(argv=None):
     sub = parser.add_subparsers(dest="cmd", required=True)
 
     p = sub.add_parser("prepare", help="prepare balanced HDF5 contexts")
-    p.add_argument("-p", dest="patch", type=positive, default=128, help="patch size")
-    p.add_argument("-w", dest="window", type=powersz, default=128, help="window size")
-    p.add_argument("-H", dest="halo", type=nonnegative, default=16, help="feature halo")
     p.add_argument(
-        "-v", dest="ratio", type=fraction, default=0.2, help="validation ratio"
+        "-p", dest="patch", type=positive, default=128, help="patch size [%(default)d]"
+    )
+    p.add_argument(
+        "-w", dest="window", type=powersz, default=128, help="window size [%(default)d]"
+    )
+    p.add_argument(
+        "-H",
+        dest="halo",
+        type=nonnegative,
+        default=16,
+        help="feature halo [%(default)d]",
+    )
+    p.add_argument(
+        "-v",
+        dest="ratio",
+        type=fraction,
+        default=0.2,
+        help="validation ratio [%(default)f]",
     )
     p.add_argument("dem", type=Path, help="input elevation raster")
     p.add_argument("annotation", type=Path, help="input annotation vectors")
-    p.add_argument("train", type=Path, help="output training contexts (h5)")
-    p.add_argument("val", type=Path, help="output validation contexts (h5)")
+    p.add_argument("context", type=Path, help="output data contexts (h5)")
     p.set_defaults(func=prepare, parser=p)
 
     t = sub.add_parser("train", help="train detector")
-    t.add_argument("-b", dest="batch", type=positive, default=8, help="batch size")
-    t.add_argument("-e", dest="epochs", type=positive, default=20, help="epochs")
-    t.add_argument("train", type=Path, help="training contexts (h5)")
-    t.add_argument("val", type=Path, help="validation contexts (h5)")
+    t.add_argument(
+        "-b", dest="batch", type=positive, default=8, help="batch size [%(default)d]"
+    )
+    t.add_argument(
+        "-e", dest="epochs", type=positive, default=20, help="epochs [%(default)d]"
+    )
+    t.add_argument("context", type=Path, help="data contexts (h5)")
     t.add_argument("model", type=Path, help="output model")
     t.set_defaults(func=train, parser=t)
 
@@ -611,3 +600,63 @@ def main(argv=None):
 
 if __name__ == "__main__":
     sys.exit(main())
+
+# class modReLU(nn.Module):
+#     def __init__(self, channels):
+#         super().__init__()
+#         self.bias = nn.Parameter(torch.full((channels,), -0.1))
+
+#     def forward(self, z):
+#         m = z.abs()
+#         b = self.bias.view(1, -1, 1, 1)
+#         s = F.relu(m + b) / m.clamp_min(1e-8)
+#         return z * s
+
+
+# class ReflectConv(nn.Module):
+#     def __init__(self, cin, cout, stride=1):
+#         super().__init__()
+#         self.conv = nn.Conv2d(cin, cout, 3, stride=stride, dtype=torch.complex64)
+
+#     def forward(self, x):
+#         real = F.pad(x.real, (1, 1, 1, 1), mode="reflect")
+#         imag = F.pad(x.imag, (1, 1, 1, 1), mode="reflect")
+#         return self.conv(torch.complex(real, imag))
+
+
+# def block(cin, cout, stride=1):
+#     return nn.Sequential(
+#         ReflectConv(cin, cout, stride),
+#         modReLU(cout),
+#         ReflectConv(cout, cout),
+#         modReLU(cout),
+#     )
+
+
+# class Net(nn.Module):
+#     def __init__(self, voices):
+#         super().__init__()
+#         c = torch.complex64
+#         self.register_buffer("scale", torch.ones(voices))
+#         self.e1 = block(voices, 64)
+#         self.e2 = block(64, 128, 2)
+#         self.e3 = block(128, 256, 2)
+#         self.b = block(256, 512, 2)
+#         self.up3 = nn.ConvTranspose2d(512, 256, 2, stride=2, dtype=c)
+#         self.d3 = block(512, 256)
+#         self.up2 = nn.ConvTranspose2d(256, 128, 2, stride=2, dtype=c)
+#         self.d2 = block(256, 128)
+#         self.up1 = nn.ConvTranspose2d(128, 64, 2, stride=2, dtype=c)
+#         self.d1 = block(128, 64)
+#         self.head = nn.Conv2d(128, 1, 1)
+#
+#     def forward(self, x):
+#         x = x / self.scale.view(1, -1, 1, 1)
+#         x1 = self.e1(x)
+#         x2 = self.e2(x1)
+#         x3 = self.e3(x2)
+#         x = self.b(x3)
+#         x = self.d3(torch.cat((self.up3(x), x3), 1))
+#         x = self.d2(torch.cat((self.up2(x), x2), 1))
+#         x = self.d1(torch.cat((self.up1(x), x1), 1))
+#         return self.head(torch.cat((x.real, x.imag), 1))
