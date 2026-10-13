@@ -1,0 +1,22 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "laslnet"
+version = "0.1.0"
+description = "DEM landslide accumulation detector"
+requires-python = ">=3.10"
+dependencies = [
+    "fiona",
+    "h5py",
+    "numpy",
+    "rasterio",
+    "torch",
+]
+
+[project.scripts]
+laslnet = "laslnet.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
