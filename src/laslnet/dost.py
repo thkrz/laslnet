@@ -16,7 +16,7 @@ def dost(im):
     N = im.shape[-1]
     m = N // 2
     n = N.bit_length() - 2
-    IM = torch.fft.fft2(im) / (N * N)
+    IM = torch.fft.fft2(im, norm="ortho")
 
     cols = [IM[..., 0]]
     for p in range(n):
@@ -49,12 +49,15 @@ def dost(im):
 
 @torch.no_grad()
 def embed(data, field, window, device):
-    voices = 2 * (window.bit_length() - 1)
-    channels = voices * voices
+    side = 2 * (window.bit_length() - 1)
 
     data = torch.as_tensor(data, dtype=torch.float32, device=device).contiguous()
     wins = data.unfold(0, window, 1).unfold(1, window, 1)
-    out = torch.empty((field * field, channels), dtype=torch.complex64, device=device)
+    out = torch.empty(
+        (field * field, side, side),
+        dtype=torch.complex64,
+        device=device,
+    )
     batch = max(1, (256 * 1024 * 1024) // (4 * window * window))
 
     for i in range(0, len(out), batch):
@@ -62,8 +65,7 @@ def embed(data, field, window, device):
         indices = torch.arange(i, j, device=device)
         x = wins[indices // field, indices % field]
         x = x - x.mean((-1, -2), keepdim=True)
-        z = dost(x)
-        out[i:j] = z.reshape(j - i, channels)
-        del x, z
+        out[i:j] = dost(x)
+        del x
 
-    return out.reshape(field, field, channels).permute(2, 0, 1).contiguous()
+    return out.reshape(field, field, side, side).permute(2, 3, 0, 1).contiguous()

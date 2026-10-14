@@ -62,8 +62,9 @@ def scale(path, device):
     count = 0
 
     for x, _ in samples(path, "train", 1, device):
-        energy += x.abs().square().sum((0, 2, 3), dtype=torch.float64)
-        count += x.shape[0] * x.shape[2] * x.shape[3]
+        v = x.flatten(1, 2)
+        energy += v.abs().square().sum((0, 2, 3), dtype=torch.float64)
+        count += x.shape[0] * x.shape[-2] * x.shape[-1]
 
     sc = (energy / count).sqrt().float()
     sc[sc < 1e-6] = 1

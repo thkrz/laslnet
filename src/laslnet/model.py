@@ -1,38 +1,40 @@
+import math
+
 import torch
 from torch import nn
-from torch.nn import functional as F
 
-
-class modReLU(nn.Module):
-    def __init__(self, channels):
-        super().__init__()
-        self.bias = nn.Parameter(torch.full((channels,), -0.1))
-
-    def forward(self, z):
-        m = z.abs()
-        b = self.bias.view(1, -1, *((1,) * (z.ndim - 2)))
-        s = F.relu(m + b) / m.clamp_min(1e-8)
-        return z * s
+from laslnet.nn import Conv4d, modReLU
 
 
 class Net(nn.Module):
     def __init__(self, voices):
         super().__init__()
+        self.side = math.isqrt(voices)
+        if self.side * self.side != voices or self.side < 5:
+            raise ValueError(
+                "expected a square voice grid with at least five voices per axis"
+            )
+
         self.register_buffer("scale", torch.ones(voices))
-        self.layers = nn.Sequential(
-            nn.Conv2d(2 * voices, 32, 1),
-            nn.ReLU(),
-            nn.Conv2d(32, 32, 3, padding=1),
-            nn.ReLU(),
-            nn.Conv2d(32, 32, 3, padding=1),
+        self.features = nn.Sequential(
+            Conv4d(1, 4, (3, 3, 3, 3), padding=(0, 0, 1, 1)),
+            modReLU(4),
+            Conv4d(4, 4, (3, 3, 3, 3), padding=(0, 0, 1, 1)),
+            modReLU(4),
+        )
+        channels = 2 * 4 * (self.side - 4) ** 2
+        self.head = nn.Sequential(
+            nn.Conv2d(channels, 32, 1),
             nn.ReLU(),
             nn.Conv2d(32, 1, 1),
         )
 
     def forward(self, x):
-        x = x / self.scale.view(1, -1, 1, 1)
+        x = x / self.scale.view(1, self.side, self.side, 1, 1)
+        x = self.features(x.unsqueeze(1))
+        x = x.flatten(1, 3)
         x = torch.cat((x.real, x.imag), dim=1)
-        return self.layers(x)
+        return self.head(x)
 
 
 def core(logits, halo):
