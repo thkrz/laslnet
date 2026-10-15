@@ -1,0 +1,5 @@
+Below is my model for a 4D complex-valued convolutional neural network (CVNN). It processes a Stockwell-transform DOST voice image with dimensions `(voice_x, voice_y, window_x, window_y)`.
+
+Please review the `conv4d` implementation and determine whether it is correct, noting any bugs, assumptions, or limitations. Then suggest improvements to the model for classifying landslides from digital elevation models (DEMs), drawing on relevant ideas from other CNN-based landslide-classification approaches.
+
+CNNs applied to DEMs are often described as unreliable. Please assess whether this may be due in part to unsuitable CNN architectures, and explain what architectural or methodological choices could make the approach more effective.

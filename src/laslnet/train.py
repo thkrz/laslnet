@@ -8,13 +8,22 @@ from laslnet.model import Net, core, save
 
 
 @torch.no_grad()
-def validate(net, path, batch, halo, device):
+def validate(net, path, batch, halo, device, weight):
     net.eval()
+    total = torch.zeros((), device=device)
+    count = 0
     intersection = 0
     union = 0
 
     for x, y in samples(path, "val", batch, device):
-        pred = core(net(x)[:, 0], halo) >= 0
+        logits = core(net(x)[:, 0], halo)
+        loss = F.binary_cross_entropy_with_logits(logits, y, pos_weight=weight)
+
+        size = y.shape[0]
+        total += loss * size
+        count += size
+
+        pred = logits >= 0
         truth = y != 0
         intersection += (pred & truth).sum().item()
         union += (pred | truth).sum().item()
@@ -22,7 +31,7 @@ def validate(net, path, batch, halo, device):
     if union == 0:
         raise ValueError("validation IoU undefined: empty union")
 
-    return intersection / union
+    return total.item() / count, intersection / union
 
 
 def train(args, device):
@@ -37,6 +46,12 @@ def train(args, device):
     net.scale.copy_(scale(args.context, device))
     weight = torch.tensor(posweight(args.context), device=device)
     opt = torch.optim.Adam(net.parameters(), lr=0.0003)
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        opt,
+        mode="min",
+        factor=0.5,
+        patience=10,
+    )
     best = -1.0
 
     for epoch in range(args.epochs):
@@ -56,7 +71,7 @@ def train(args, device):
             count += size
 
         train_loss = total.item() / count
-        iou = validate(net, args.context, args.batch, halo, device)
+        val_loss, iou = validate(net, args.context, args.batch, halo, device, weight)
         improved = iou > best
 
         if improved:
@@ -65,10 +80,13 @@ def train(args, device):
 
         print(
             f"epoch={epoch + 1} loss={train_loss:.6f} "
-            f"val_iou={iou:.6f} best_iou={best:.6f} "
+            f"val_loss={val_loss:.6f} val_iou={iou:.6f} "
+            f"best_iou={best:.6f} lr={opt.param_groups[0]['lr']:.6g} "
             f"saved={int(improved)}",
             file=sys.stderr,
             flush=True,
         )
+
+        scheduler.step(val_loss)
 
     return 0

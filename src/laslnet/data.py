@@ -186,12 +186,10 @@ def prepare(args):
         parser.error("no annotated patches in validation split")
     if len(train_neg) < len(train_pos):
         parser.error("insufficient empty patches in training split")
-    if len(val_neg) < len(val_pos):
-        parser.error("insufficient empty patches in validation split")
 
     rng = random.Random(0)
     training = train_pos + rng.sample(train_neg, len(train_pos))
-    validation = val_pos + rng.sample(val_neg, len(val_pos))
+    validation = val_pos + val_neg
     rng.shuffle(training)
     rng.shuffle(validation)
 
@@ -235,6 +233,6 @@ def prepare(args):
         f"training annotated={len(train_pos)} empty={len(train_pos)} total={len(training)}"
     )
     print(
-        f"validation annotated={len(val_pos)} empty={len(val_pos)} total={len(validation)}"
+        f"validation annotated={len(val_pos)} empty={len(val_neg)} total={len(validation)}"
     )
     return 0
